@@ -21,6 +21,10 @@ output:
     None on console, creates entities in Iottwinmaker workspace
 '''
 
+#Caches
+created_component_types = dict()
+created_entities = dict()
+
 def get_iottwinmaker_client():
     #load_env()
     iottwinmaker = boto3_session().client('iottwinmaker')
@@ -30,7 +34,6 @@ SERVICE_ENDPOINT= os.environ.get('AWS_ENDPOINT')
 s3 = boto3_session().client('s3')
 iottwinmaker_client = get_iottwinmaker_client()
 
-## -f as the input iottwinmaker json file
 def parse_arguments():
   parser = argparse.ArgumentParser(
                   description='Load JSON entities into Iottwinmaker')
@@ -53,12 +56,18 @@ def parse_arguments():
   return parser
 
 def create_properties_component(workspace_id, comp_id):
+    if comp_id in created_component_types:
+        log(f"Component type {comp_id} already created, skipping.")
+        return
     if not comp_id:
         return
+    log("API call: list component types")
     cs = iottwinmaker_client.list_component_types(workspaceId = workspace_id)
     for c in cs.get('componentTypeSummaries'):
         if comp_id and comp_id == c.get("componentTypeId"):
+            created_component_types[comp_id] = 1
             return
+    log(f"API call: create component type: {comp_id}")
     resp = iottwinmaker_client.create_component_type(
             workspaceId = workspace_id,
             componentTypeId = comp_id,
@@ -73,12 +82,15 @@ def create_properties_component(workspace_id, comp_id):
             }
         )
     api_report(resp)
+    log(f"API call: get component type: {comp_id}")
     wait_over(iottwinmaker_client.get_component_type,
                 {"componentTypeId":comp_id, "workspaceId":workspace_id},
                 'status.state', 'ACTIVE')
+    created_component_types[comp_id] = 1
 
 #def create_workspace(workspace_id):
 def create_workspace(workspace_id, iottwinmaker_role_arn):
+    log(f"API call: list workspaces")
     ws = iottwinmaker_client.list_workspaces()
     for w in ws.get("workspaceSummaries"):
         if workspace_id == w.get("workspaceId"):
@@ -89,6 +101,7 @@ def create_workspace(workspace_id, iottwinmaker_role_arn):
     bucket_created.wait(Bucket=bucket_name)
 
     iot_role = iottwinmaker_role_arn if iottwinmaker_role_arn else get_role_from_identity()
+    log(f"API call: create workspace: {workspace_id}")
     resp = iottwinmaker_client.create_workspace(
             workspaceId = workspace_id,
             s3Location = 'arn:aws:s3:::' + bucket_name,
@@ -110,14 +123,18 @@ def populate_assets(entity, comp_id, workspace_id):
     return components
 
 def entity_exists(workspace_id, entity_id):
+    #Check cache first
+    if entity_id in created_entities:
+        return True
     try:
+        log(f"API call: get entity: {entity_id}")
         resp = iottwinmaker_client.get_entity(
             workspaceId = workspace_id,
             entityId = entity_id)
         api_report(resp)
     except:
-        return False
-
+        return False        
+    created_entities[entity_id] = 1 
     return True
 
 def get_parent_from_input(input_entities, parent_id):
@@ -138,7 +155,7 @@ def create_root(root_id, root_name, workspace_id):
     }
 
 
-def create_iottwinmaker_entity(input_entities, entity, workspace_id, comps):
+def create_iottwinmaker_entity(input_entities, entity, workspace_id, comps, check_active = False):
     entity_id = entity.get("entity_id")
     parent_id = entity.get("parent_entity_id")
     entity_name = entity.get("entity_name")
@@ -149,6 +166,7 @@ def create_iottwinmaker_entity(input_entities, entity, workspace_id, comps):
     log(f"Processing entity {entity_id}, parent {parent_id}")
 
     if entity_exists(workspace_id, entity_id):
+        log(f"Entity {entity_id} already exists, not creating again")
         return
 
     comps = populate_assets(entity, comp_id, workspace_id) if comp_id else comps
@@ -158,10 +176,10 @@ def create_iottwinmaker_entity(input_entities, entity, workspace_id, comps):
         if not parent_exists:
             parent = get_parent_from_input(input_entities, parent_id)
             if parent is not None:
-                create_iottwinmaker_entity(input_entities, parent, workspace_id, comps)
+                create_iottwinmaker_entity(input_entities, parent, workspace_id, comps, True)
             else:
                 root = create_root(parent_id, parent_name, workspace_id)
-                create_entity_api(comps, root, workspace_id)
+                create_entity_api(comps, root, workspace_id, True)
     else:
         parent_id = '$ROOT'
 
@@ -171,19 +189,24 @@ def create_iottwinmaker_entity(input_entities, entity, workspace_id, comps):
         "description": description,
         "workspaceId": workspace_id }
 
-    create_entity_api(comps, ntt, workspace_id)
+    create_entity_api(comps, ntt, workspace_id, check_active)
 
 
-def create_entity_api(comps, ntt, workspace_id):
+def create_entity_api(comps, ntt, workspace_id, check_active = False):
+    log(f"API call: create entity: {ntt['entityId']}")
     if comps:
         resp = iottwinmaker_client.create_entity(
             **ntt, components=comps)
     else:
         resp = iottwinmaker_client.create_entity(**ntt)
     api_report(resp)
-    wait_over(iottwinmaker_client.get_entity,
-              {"entityId": ntt.get('entityId'), "workspaceId": workspace_id},
-              'status.state', 'ACTIVE')
+    if check_active:
+        log(f"API call: get entity: {ntt['entityId']}")
+        wait_over(iottwinmaker_client.get_entity,
+                {"entityId": ntt.get('entityId'), "workspaceId": workspace_id},
+                'status.state', 'ACTIVE')
+
+
 
 
 def show_entity(entity):
@@ -220,7 +243,8 @@ def main():
         return
     parser = parse_arguments()
     args = parser.parse_args()
-
+    #Push logs to stdout as well
+    logging.getLogger().addHandler(logging.StreamHandler())
     log("Starting import...")
     import_handler( {'body':{
                 'outputBucket':args.bucket,
